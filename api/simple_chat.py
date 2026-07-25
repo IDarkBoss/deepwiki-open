@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Callable
 from functools import partial
@@ -50,7 +51,7 @@ async def chat_completions_stream(request: ChatCompletionRequest):
         if request.messages and len(request.messages) > 0:
             last_message = request.messages[-1]
             if hasattr(last_message, 'content') and last_message.content:
-                tokens = count_tokens(last_message.content, request.provider == "ollama")
+                tokens = count_tokens(last_message.content, embedder_type=request.provider)
                 logger.info(f"Request size: {tokens} tokens")
                 if tokens > MAX_INPUT_TOKENS:
                     logger.warning(f"Request exceeds recommended token limit ({tokens} > {MAX_INPUT_TOKENS})")
@@ -58,7 +59,12 @@ async def chat_completions_stream(request: ChatCompletionRequest):
 
         # Create a new RAG instance for this request
         try:
-            request_rag = RAG(provider=request.provider, model=request.model)
+            # async do RAG initialization
+            request_rag = await asyncio.to_thread(
+                RAG,
+                provider=request.provider,
+                model=request.model,
+            )
 
             # Extract custom file filter parameters if provided
             if request.excluded_dirs:
@@ -70,7 +76,7 @@ async def chat_completions_stream(request: ChatCompletionRequest):
             if request.included_files:
                 logger.info(f"Using custom included files: {request.included_files}")
 
-            request_rag.prepare_retriever(
+            await request_rag.aprepare_retriever(
                 request.repo_url,
                 request.type,
                 request.token,
@@ -116,22 +122,11 @@ async def chat_completions_stream(request: ChatCompletionRequest):
                     )
 
         # Check if this is a Deep Research request
-        is_deep_research = False
-        research_iteration = 1
-
-        # Process messages to detect Deep Research requests
-        for msg in request.messages:
-            if hasattr(msg, 'content') and msg.content and "[DEEP RESEARCH]" in msg.content:
-                is_deep_research = True
-                # Only remove the tag from the last message
-                if msg == request.messages[-1]:
-                    # Remove the Deep Research tag
-                    msg.content = msg.content.replace("[DEEP RESEARCH]", "").strip()
+        is_deep_research = last_message.mode == "deep_research"
 
         # Count research iterations if this is a Deep Research request
         if is_deep_research:
-            research_iteration = sum(1 for msg in request.messages if msg.role == 'assistant') + 1
-            logger.info(f"Deep Research request detected - iteration {research_iteration}")
+            logger.info("Deep Research request detected - iteration %d",request.research_iteration)
 
             # Check if this is a continuation request
             if "continue" in last_message.content.lower() and "research" in last_message.content.lower():
@@ -139,7 +134,7 @@ async def chat_completions_stream(request: ChatCompletionRequest):
                 original_topic = None
                 for msg in request.messages:
                     if msg.role == "user" and "continue" not in msg.content.lower():
-                        original_topic = msg.content.replace("[DEEP RESEARCH]", "").strip()
+                        original_topic = msg.content.strip()
                         logger.info(f"Found original research topic: {original_topic}")
                         break
 
@@ -167,7 +162,7 @@ async def chat_completions_stream(request: ChatCompletionRequest):
                 # Try to perform RAG retrieval
                 try:
                     # This will use the actual RAG implementation
-                    retrieved_documents = request_rag(rag_query, language=request.language)
+                    retrieved_documents = await request_rag.acall(rag_query, language=request.language)
 
                     if retrieved_documents and retrieved_documents[0].documents:
                         # Format context for the prompt in a more structured way
@@ -219,10 +214,10 @@ async def chat_completions_stream(request: ChatCompletionRequest):
         # Create system prompt
         if is_deep_research:
             # Check if this is the first iteration
-            is_first_iteration = research_iteration == 1
+            is_first_iteration = request.research_iteration == 1
 
             # Check if this is the final iteration
-            is_final_iteration = research_iteration >= 5
+            is_final_iteration = request.research_iteration >= 5
 
             if is_first_iteration:
                 system_prompt = DEEP_RESEARCH_FIRST_ITERATION_PROMPT.format(
@@ -243,7 +238,7 @@ async def chat_completions_stream(request: ChatCompletionRequest):
                     repo_type=repo_type,
                     repo_url=repo_url,
                     repo_name=repo_name,
-                    research_iteration=research_iteration,
+                    research_iteration=request.research_iteration,
                     language_name=language_name
                 )
         else:
@@ -258,7 +253,13 @@ async def chat_completions_stream(request: ChatCompletionRequest):
         file_content = ""
         if request.filePath:
             try:
-                file_content = get_file_content(request.repo_url, request.filePath, request.type, request.token)
+                file_content = await asyncio.to_thread(
+                    get_file_content,
+                    repo_url=request.repo_url,
+                    file_path=request.filePath,
+                    repo_type=request.type,
+                    access_token=request.token,
+                )
                 logger.info(f"Successfully retrieved content for file: {request.filePath}")
             except Exception as e:
                 logger.error(f"Error retrieving file content: {str(e)}")

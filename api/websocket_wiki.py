@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Callable
 from functools import partial
@@ -43,7 +44,7 @@ async def handle_websocket_chat(websocket: WebSocket):
         if request.messages and len(request.messages) > 0:
             last_message = request.messages[-1]
             if hasattr(last_message, 'content') and last_message.content:
-                tokens = count_tokens(last_message.content, request.provider == "ollama")
+                tokens = count_tokens(last_message.content, embedder_type=request.provider)
                 logger.info(f"Request size: {tokens} tokens")
                 if tokens > MAX_INPUT_TOKENS:
                     logger.warning(f"Request exceeds recommended token limit ({tokens} > {MAX_INPUT_TOKENS})")
@@ -51,7 +52,11 @@ async def handle_websocket_chat(websocket: WebSocket):
 
         # Create a new RAG instance for this request
         try:
-            request_rag = RAG(provider=request.provider, model=request.model)
+            request_rag = await asyncio.to_thread(
+                RAG,
+                provider=request.provider,
+                model=request.model,
+            )
 
             # Extract custom file filter parameters if provided
             if request.excluded_dirs:
@@ -63,7 +68,7 @@ async def handle_websocket_chat(websocket: WebSocket):
             if request.included_files:
                 logger.info(f"Using custom included files: {request.included_files}")
 
-            request_rag.prepare_retriever(
+            await request_rag.aprepare_retriever(
                 request.repo_url,
                 request.type,
                 request.token,
@@ -77,12 +82,10 @@ async def handle_websocket_chat(websocket: WebSocket):
             if "No valid documents with embeddings found" in str(e):
                 logger.error(f"No valid embeddings found: {str(e)}")
                 await websocket.send_text("Error: No valid document embeddings found. This may be due to embedding size inconsistencies or API errors during document processing. Please try again or check your repository content.")
-                await websocket.close()
                 return
             else:
                 logger.error(f"ValueError preparing retriever: {str(e)}")
                 await websocket.send_text(f"Error preparing retriever: {str(e)}")
-                await websocket.close()
                 return
         except Exception as e:
             logger.error(f"Error preparing retriever: {str(e)}")
@@ -91,19 +94,16 @@ async def handle_websocket_chat(websocket: WebSocket):
                 await websocket.send_text("Error: Inconsistent embedding sizes detected. Some documents may have failed to embed properly. Please try again.")
             else:
                 await websocket.send_text(f"Error preparing retriever: {str(e)}")
-            await websocket.close()
             return
 
         # Validate request
         if not request.messages or len(request.messages) == 0:
             await websocket.send_text("Error: No messages provided")
-            await websocket.close()
             return
 
         last_message = request.messages[-1]
         if last_message.role != "user":
             await websocket.send_text("Error: Last message must be from the user")
-            await websocket.close()
             return
 
         # Process previous messages to build conversation history
@@ -119,22 +119,11 @@ async def handle_websocket_chat(websocket: WebSocket):
                     )
 
         # Check if this is a Deep Research request
-        is_deep_research = False
-        research_iteration = 1
-
-        # Process messages to detect Deep Research requests
-        for msg in request.messages:
-            if hasattr(msg, 'content') and msg.content and "[DEEP RESEARCH]" in msg.content:
-                is_deep_research = True
-                # Only remove the tag from the last message
-                if msg == request.messages[-1]:
-                    # Remove the Deep Research tag
-                    msg.content = msg.content.replace("[DEEP RESEARCH]", "").strip()
+        is_deep_research = last_message.mode == "deep_research"
 
         # Count research iterations if this is a Deep Research request
         if is_deep_research:
-            research_iteration = sum(1 for msg in request.messages if msg.role == 'assistant') + 1
-            logger.info(f"Deep Research request detected - iteration {research_iteration}")
+            logger.info("Deep Research request detected - iteration %d", request.research_iteration)
 
             # Check if this is a continuation request
             if "continue" in last_message.content.lower() and "research" in last_message.content.lower():
@@ -142,7 +131,7 @@ async def handle_websocket_chat(websocket: WebSocket):
                 original_topic = None
                 for msg in request.messages:
                     if msg.role == "user" and "continue" not in msg.content.lower():
-                        original_topic = msg.content.replace("[DEEP RESEARCH]", "").strip()
+                        original_topic = msg.content.strip()
                         logger.info(f"Found original research topic: {original_topic}")
                         break
 
@@ -170,7 +159,7 @@ async def handle_websocket_chat(websocket: WebSocket):
                 # Try to perform RAG retrieval
                 try:
                     # This will use the actual RAG implementation
-                    retrieved_documents = request_rag(rag_query, language=request.language)
+                    retrieved_documents = await request_rag.acall(rag_query, language=request.language)
 
                     if retrieved_documents and retrieved_documents[0].documents:
                         # Format context for the prompt in a more structured way
@@ -222,10 +211,10 @@ async def handle_websocket_chat(websocket: WebSocket):
         # Create system prompt
         if is_deep_research:
             # Check if this is the first iteration
-            is_first_iteration = research_iteration == 1
+            is_first_iteration = request.research_iteration == 1
 
             # Check if this is the final iteration
-            is_final_iteration = research_iteration >= 5
+            is_final_iteration = request.research_iteration >= 5
 
             if is_first_iteration:
                 system_prompt = DEEP_RESEARCH_FIRST_ITERATION_PROMPT.format(
@@ -246,7 +235,7 @@ async def handle_websocket_chat(websocket: WebSocket):
                     repo_type=repo_type,
                     repo_url=repo_url,
                     repo_name=repo_name,
-                    research_iteration=research_iteration,
+                    research_iteration=request.research_iteration,
                     language_name=language_name
                 )
         else:
@@ -261,7 +250,13 @@ async def handle_websocket_chat(websocket: WebSocket):
         file_content = ""
         if request.filePath:
             try:
-                file_content = get_file_content(request.repo_url, request.filePath, request.type, request.token)
+                file_content = await asyncio.to_thread(
+                    get_file_content,
+                    repo_url=request.repo_url,
+                    file_path=request.filePath,
+                    repo_type=request.type,
+                    access_token=request.token,
+                )
                 logger.info(f"Successfully retrieved content for file: {request.filePath}")
             except Exception as e:
                 logger.error(f"Error retrieving file content: {str(e)}")
@@ -272,29 +267,6 @@ async def handle_websocket_chat(websocket: WebSocket):
         for turn_id, turn in request_rag.memory().items():
             if not isinstance(turn_id, int) and hasattr(turn, 'user_query') and hasattr(turn, 'assistant_response'):
                 conversation_history += f"<turn>\n<user>{turn.user_query.query_str}</user>\n<assistant>{turn.assistant_response.response_str}</assistant>\n</turn>\n"
-
-        # Create the prompt with context
-        prompt = f"/no_think {system_prompt}\n\n"
-
-        if conversation_history:
-            prompt += f"<conversation_history>\n{conversation_history}</conversation_history>\n\n"
-
-        # Check if filePath is provided and fetch file content if it exists
-        if file_content:
-            # Add file content to the prompt after conversation history
-            prompt += f"<currentFileContent path=\"{request.filePath}\">\n{file_content}\n</currentFileContent>\n\n"
-
-        # Only include context if it's not empty
-        CONTEXT_START = "<START_OF_CONTEXT>"
-        CONTEXT_END = "<END_OF_CONTEXT>"
-        if context_text.strip():
-            prompt += f"{CONTEXT_START}\n{context_text}\n{CONTEXT_END}\n\n"
-        else:
-            # Add a note that we're skipping RAG due to size constraints or because it's the isolated API
-            logger.info("No context available from RAG")
-            prompt += "<note>Answering without retrieval augmentation.</note>\n\n"
-
-        prompt += f"<query>\n{query}\n</query>\n\nAssistant: "
 
         async def stream_and_fallback(
                 streamer: ChatStreamer,
@@ -343,7 +315,6 @@ async def handle_websocket_chat(websocket: WebSocket):
 
         async for chunk in stream_and_fallback(chat_streamer, prompt_func, simplified_prompt_func):
             await websocket.send_text(chunk)
-        await websocket.close()
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
@@ -351,6 +322,7 @@ async def handle_websocket_chat(websocket: WebSocket):
         logger.error(f"Error in WebSocket handler: {str(e)}")
         try:
             await websocket.send_text(f"Error: {str(e)}")
-            await websocket.close()
         except Exception:
             pass
+    finally:
+        await websocket.close()

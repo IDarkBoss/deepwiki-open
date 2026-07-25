@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 class ChatMessage(BaseModel):
     role: str  # 'user' or 'assistant'
     content: str
+    mode: Literal["normal", "deep_research"] = Field(default="normal")
 
 class ChatCompletionRequest(BaseModel):
     """
@@ -16,9 +17,9 @@ class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage] = Field(..., description="List of chat messages")
     filePath: Optional[str] = Field(None, description="Optional path to a file in the repository to include in the prompt")
     token: Optional[str] = Field(None, description="Personal access token for private repositories")
-    type: Optional[Literal["github", "gitlab", "bitbucket"]] = Field(
+    type: Optional[Literal["local", "github", "gitlab", "bitbucket"]] = Field(
         "github",
-        description="Type of repository (e.g., 'github', 'gitlab', 'bitbucket')",
+        description="Type of repository (e.g., 'local', 'github', 'gitlab', 'bitbucket')",
     )
 
     # model parameters
@@ -26,6 +27,13 @@ class ChatCompletionRequest(BaseModel):
     model: Optional[str] = Field(None, description="Model name for the specified provider")
 
     language: Optional[str] = Field("en", description="Language for content generation (e.g., 'en', 'ja', 'zh', 'es', 'kr', 'vi')")
+
+    research_iteration: int = Field(
+        default=1,
+        ge=1,
+        description="Current deep research iteration (1-based). Only used when the request is in deep_research mode.",
+    )
+
     excluded_dirs: List[str] = Field(
         default_factory=list,
         description="List or newline-separated string of directories to exclude from processing",

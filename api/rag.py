@@ -1,6 +1,6 @@
 import logging
-import weakref
-import re
+import asyncio
+import os
 from dataclasses import dataclass
 from typing import Any, List, Tuple, Dict
 from uuid import uuid4
@@ -47,6 +47,20 @@ logger = logging.getLogger(__name__)
 
 # Maximum token limit for embedding models
 MAX_INPUT_TOKENS = 7500  # Safe threshold below 8192 token limit
+
+# Maximum concurrent RAG preparing count
+_RAG_PREPARE_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def _get_rag_semaphore() -> asyncio.Semaphore:
+    global _RAG_PREPARE_SEMAPHORE
+    if _RAG_PREPARE_SEMAPHORE is None:
+        _RAG_PREPARE_SEMAPHORE = asyncio.Semaphore(
+            int(os.environ.get("DEEPWIKI_MAX_CONCURRENT_RAG", "4"))
+        )
+    assert isinstance(_RAG_PREPARE_SEMAPHORE, asyncio.Semaphore)
+    return _RAG_PREPARE_SEMAPHORE
+
 
 class Memory(adal.core.component.DataComponent):
     """Simple conversation management with a list of dialog turns."""
@@ -190,42 +204,6 @@ class RAG(adal.Component):
         self.memory = Memory()
         self.embedder = get_embedder(embedder_type=self.embedder_type)
         self.initialize_db_manager()
-
-        # Set up the output parser
-        data_parser = adal.DataClassParser(data_class=RAGAnswer, return_data_class=True)
-
-        # Format instructions to ensure proper output structure
-        format_instructions = data_parser.get_output_format_str() + """
-
-IMPORTANT FORMATTING RULES:
-1. DO NOT include your thinking or reasoning process in the output
-2. Provide only the final, polished answer
-3. DO NOT include ```markdown fences at the beginning or end of your answer
-4. DO NOT wrap your response in any kind of fences
-5. Start your response directly with the content
-6. The content will already be rendered as markdown
-7. Do not use backslashes before special characters like [ ] { } in your answer
-8. When listing tags or similar items, write them as plain text without escape characters
-9. For pipe characters (|) in text, write them directly without escaping them"""
-
-        # Get model configuration based on provider and model
-        from api.config import get_model_config
-        generator_config = get_model_config(self.provider, self.model)
-
-        # Set up the main generator
-        self.generator = adal.Generator(
-            template=RAG_TEMPLATE,
-            prompt_kwargs={
-                "output_format_str": format_instructions,
-                "conversation_history": self.memory(),
-                "system_prompt": system_prompt,
-                "contexts": None,
-            },
-            model_client=generator_config["model_client"](),
-            model_kwargs=generator_config["model_kwargs"],
-            output_processors=data_parser,
-        )
-
 
     def initialize_db_manager(self):
         """Initialize the database manager with local storage"""
@@ -396,6 +374,44 @@ IMPORTANT FORMATTING RULES:
                 logger.error(f"Sample embedding sizes: {', '.join(sizes)}")
             raise
 
+    async def aprepare_retriever(
+            self,
+            repo_url_or_path: str,
+            type: str = "github",
+            access_token: str | None = None,
+            excluded_dirs: list[str] | None = None,
+            excluded_files: list[str] | None = None,
+            included_dirs: list[str] | None = None,
+            included_files: list[str] | None = None,
+    ):
+        """Async version of the original `prepare_retriever`.
+
+        Reuse the synchronous `prepare_retriever` implementation, but runs it in
+        a worker thread via `asyncio.to_thread` so that blocking operations (such
+        as git.clone, file io, embedding calls) do not stall the outer event loop.
+        Concurrency is bounded by a module-level semaphore, set by system variable
+        'DEEPWIKI_MAX_CONCURRENT_RAG'.
+
+        Args:
+            repo_url_or_path: URL or local path to the repository
+            access_token: Optional access token for private repositories
+            excluded_dirs: Optional list of directories to exclude from processing
+            excluded_files: Optional list of file patterns to exclude from processing
+            included_dirs: Optional list of directories to include exclusively
+            included_files: Optional list of file patterns to include exclusively
+        """
+        async with _get_rag_semaphore():
+            return await asyncio.to_thread(
+                self.prepare_retriever,
+                repo_url_or_path,
+                type=type,
+                access_token=access_token,
+                excluded_dirs=excluded_dirs,
+                excluded_files=excluded_files,
+                included_dirs=included_dirs,
+                included_files=included_files,
+            )
+
     def call(self, query: str, language: str = "en") -> Tuple[List]:
         """
         Process a query using RAG.
@@ -426,3 +442,8 @@ IMPORTANT FORMATTING RULES:
                 answer=f"I apologize, but I encountered an error while processing your question. Please try again or rephrase your question."
             )
             return error_response, []
+
+    async def acall(self, query: str, language: str = "en") -> tuple[list]:
+        """Async version of the original `call` method.
+        """
+        return await asyncio.to_thread(self.call, query, language)
